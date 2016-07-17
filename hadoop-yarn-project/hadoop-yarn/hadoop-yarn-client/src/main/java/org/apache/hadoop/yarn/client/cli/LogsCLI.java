@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.yarn.client.cli;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.util.ArrayList;
@@ -25,9 +26,13 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.regex.Pattern;
+
 import javax.ws.rs.core.MediaType;
+
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.GnuParser;
@@ -48,13 +53,13 @@ import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerReport;
+import org.apache.hadoop.yarn.api.records.ContainerState;
 import org.apache.hadoop.yarn.api.records.YarnApplicationState;
 import org.apache.hadoop.yarn.client.api.YarnClient;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
-import org.apache.hadoop.yarn.logaggregation.LogCLIHelpers;
 import org.apache.hadoop.yarn.logaggregation.ContainerLogsRequest;
-import org.apache.hadoop.yarn.util.ConverterUtils;
+import org.apache.hadoop.yarn.logaggregation.LogCLIHelpers;
 import org.apache.hadoop.yarn.util.Times;
 import org.apache.hadoop.yarn.webapp.util.WebAppUtils;
 import org.codehaus.jettison.json.JSONArray;
@@ -77,15 +82,31 @@ public class LogsCLI extends Configured implements Tool {
   private static final String NODE_ADDRESS_OPTION = "nodeAddress";
   private static final String APP_OWNER_OPTION = "appOwner";
   private static final String AM_CONTAINER_OPTION = "am";
-  private static final String CONTAINER_LOG_FILES = "logFiles";
-  private static final String SHOW_META_INFO = "show_meta_info";
+  private static final String PER_CONTAINER_LOG_FILES_OPTION = "log_files";
   private static final String LIST_NODES_OPTION = "list_nodes";
+  private static final String SHOW_APPLICATION_LOG_INFO
+      = "show_application_log_info";
+  private static final String SHOW_CONTAINER_LOG_INFO
+      = "show_container_log_info";
   private static final String OUT_OPTION = "out";
   private static final String SIZE_OPTION = "size";
   public static final String HELP_CMD = "help";
+  private PrintStream outStream = System.out;
+  private YarnClient yarnClient = null;
 
   @Override
   public int run(String[] args) throws Exception {
+    try {
+      yarnClient = createYarnClient();
+      return runCommand(args);
+    } finally {
+      if (yarnClient != null) {
+        yarnClient.close();
+      }
+    }
+  }
+
+  private int runCommand(String[] args) throws Exception {
     Options opts = createCommandOpts();
     Options printOpts = createPrintOpts(opts);
     if (args.length < 1) {
@@ -102,8 +123,9 @@ public class LogsCLI extends Configured implements Tool {
     String nodeAddress = null;
     String appOwner = null;
     boolean getAMContainerLogs = false;
-    boolean showMetaInfo = false;
     boolean nodesList = false;
+    boolean showApplicationLogInfo = false;
+    boolean showContainerLogInfo = false;
     String[] logFiles = null;
     List<String> amContainersList = new ArrayList<String>();
     String localDir = null;
@@ -115,9 +137,11 @@ public class LogsCLI extends Configured implements Tool {
       nodeAddress = commandLine.getOptionValue(NODE_ADDRESS_OPTION);
       appOwner = commandLine.getOptionValue(APP_OWNER_OPTION);
       getAMContainerLogs = commandLine.hasOption(AM_CONTAINER_OPTION);
-      showMetaInfo = commandLine.hasOption(SHOW_META_INFO);
       nodesList = commandLine.hasOption(LIST_NODES_OPTION);
       localDir = commandLine.getOptionValue(OUT_OPTION);
+      showApplicationLogInfo = commandLine.hasOption(
+          SHOW_APPLICATION_LOG_INFO);
+      showContainerLogInfo = commandLine.hasOption(SHOW_CONTAINER_LOG_INFO);
       if (getAMContainerLogs) {
         try {
           amContainersList = parseAMContainer(commandLine, printOpts);
@@ -126,8 +150,8 @@ public class LogsCLI extends Configured implements Tool {
           return -1;
         }
       }
-      if (commandLine.hasOption(CONTAINER_LOG_FILES)) {
-        logFiles = commandLine.getOptionValues(CONTAINER_LOG_FILES);
+      if (commandLine.hasOption(PER_CONTAINER_LOG_FILES_OPTION)) {
+        logFiles = commandLine.getOptionValues(PER_CONTAINER_LOG_FILES_OPTION);
       }
       if (commandLine.hasOption(SIZE_OPTION)) {
         bytes = Long.parseLong(commandLine.getOptionValue(SIZE_OPTION));
@@ -168,6 +192,21 @@ public class LogsCLI extends Configured implements Tool {
         }
       } catch (Exception e) {
         System.err.println("Invalid ContainerId specified");
+        return -1;
+      }
+    }
+
+    if (showApplicationLogInfo && showContainerLogInfo) {
+      System.err.println("Invalid options. Can only accept one of "
+          + "show_application_log_info/show_container_log_info.");
+      return -1;
+    }
+
+    if (localDir != null) {
+      File file = new File(localDir);
+      if (file.exists() && file.isFile()) {
+        System.err.println("Invalid value for -out option. "
+            + "Please provide a directory.");
         return -1;
       }
     }
@@ -213,16 +252,19 @@ public class LogsCLI extends Configured implements Tool {
 
     ContainerLogsRequest request = new ContainerLogsRequest(appId,
         isApplicationFinished(appState), appOwner, nodeAddress, null,
-        containerIdStr, localDir, logs, bytes);
+        containerIdStr, localDir, logs, bytes, null);
 
-    if (showMetaInfo) {
-      return showMetaInfo(request, logCliHelper);
+    if (showContainerLogInfo) {
+      return showContainerLogInfo(request, logCliHelper);
     }
 
     if (nodesList) {
       return showNodeLists(request, logCliHelper);
     }
 
+    if (showApplicationLogInfo) {
+      return showApplicationLogInfo(request, logCliHelper);
+    }
     // To get am logs
     if (getAMContainerLogs) {
       return fetchAMContainerLogs(request, amContainersList,
@@ -246,21 +288,15 @@ public class LogsCLI extends Configured implements Tool {
 
   private ApplicationReport getApplicationReport(ApplicationId appId)
       throws IOException, YarnException {
-    YarnClient yarnClient = createYarnClient();
-
-    try {
-      return yarnClient.getApplicationReport(appId);
-    } finally {
-      yarnClient.close();
-    }
+    return yarnClient.getApplicationReport(appId);
   }
   
   @VisibleForTesting
   protected YarnClient createYarnClient() {
-    YarnClient yarnClient = YarnClient.createYarnClient();
-    yarnClient.init(getConf());
-    yarnClient.start();
-    return yarnClient;
+    YarnClient client = YarnClient.createYarnClient();
+    client.init(getConf());
+    client.start();
+    return client;
   }
 
   public static void main(String[] args) throws Exception {
@@ -272,7 +308,7 @@ public class LogsCLI extends Configured implements Tool {
   }
 
   private void printHelpMessage(Options options) {
-    System.out.println("Retrieve logs for completed YARN applications.");
+    outStream.println("Retrieve logs for YARN applications.");
     HelpFormatter formatter = new HelpFormatter();
     formatter.printHelp("yarn logs -applicationId <application ID> [OPTIONS]",
         new Options());
@@ -327,18 +363,24 @@ public class LogsCLI extends Configured implements Tool {
   }
 
   private boolean fetchAllLogFiles(String[] logFiles) {
-    if(logFiles != null) {
-      List<String> logs = Arrays.asList(logFiles);
-      if(logs.contains("ALL") || logs.contains(".*")) {
-        return true;
-      }
+
+    // If no value is specified for the PER_CONTAINER_LOG_FILES_OPTION option,
+    // we will assume all logs.
+    if (logFiles == null || logFiles.length == 0) {
+      return true;
     }
+
+    List<String> logs = Arrays.asList(logFiles);
+    if (logs.contains("ALL") || logs.contains(".*")) {
+      return true;
+    }
+
     return false;
   }
 
-  private List<String> getContainerLogFiles(Configuration conf,
+  private List<PerLogFileInfo> getContainerLogFiles(Configuration conf,
       String containerIdStr, String nodeHttpAddress) throws IOException {
-    List<String> logFiles = new ArrayList<>();
+    List<PerLogFileInfo> logFileInfos = new ArrayList<>();
     Client webServiceClient = Client.create();
     try {
       WebResource webResource = webServiceClient
@@ -354,7 +396,9 @@ public class LogsCLI extends Configured implements Tool {
           JSONObject json = response.getEntity(JSONObject.class);
           JSONArray array = json.getJSONArray("containerLogInfo");
           for (int i = 0; i < array.length(); i++) {
-            logFiles.add(array.getJSONObject(i).getString("fileName"));
+            String fileName = array.getJSONObject(i).getString("fileName");
+            String fileSize = array.getJSONObject(i).getString("fileSize");
+            logFileInfos.add(new PerLogFileInfo(fileName, fileSize));
           }
         } catch (Exception e) {
           System.err.println("Unable to parse json from webservice. Error:");
@@ -367,7 +411,7 @@ public class LogsCLI extends Configured implements Tool {
       System.err.println("Unable to fetch log files list");
       throw new IOException(ex);
     }
-    return logFiles;
+    return logFileInfos;
   }
 
   @Private
@@ -378,15 +422,26 @@ public class LogsCLI extends Configured implements Tool {
     String containerIdStr = request.getContainerId().toString();
     String localDir = request.getOutputLocalDir();
     String nodeHttpAddress = request.getNodeHttpAddress();
+    if (nodeHttpAddress == null || nodeHttpAddress.isEmpty()) {
+      System.err.println("Can not get the logs for the container: "
+          + containerIdStr);
+      System.err.println("The node http address is required to get container "
+          + "logs for the Running application.");
+      return -1;
+    }
     String nodeId = request.getNodeId();
     PrintStream out = logCliHelper.createPrintStream(localDir, nodeId,
         containerIdStr);
     try {
       // fetch all the log files for the container
-      // filter the log files based on the given --logFiles pattern
-      List<String> allLogs=
+      // filter the log files based on the given -log_files pattern
+      List<PerLogFileInfo> allLogFileInfos=
           getContainerLogFiles(getConf(), containerIdStr, nodeHttpAddress);
-      List<String> matchedFiles = getMatchedLogFiles(request, allLogs);
+      List<String> fileNames = new ArrayList<String>();
+      for (PerLogFileInfo fileInfo : allLogFileInfos) {
+        fileNames.add(fileInfo.getFileName());
+      }
+      List<String> matchedFiles = getMatchedLogFiles(request, fileNames);
       if (matchedFiles.isEmpty()) {
         System.err.println("Can not find any log file matching the pattern: "
             + request.getLogTypes() + " for the container: " + containerIdStr
@@ -397,8 +452,8 @@ public class LogsCLI extends Configured implements Tool {
       newOptions.setLogTypes(matchedFiles);
 
       Client webServiceClient = Client.create();
-      String containerString = "\n\nContainer: " + containerIdStr + " on "
-          + nodeId;
+      String containerString = String.format(
+          LogCLIHelpers.CONTAINER_ON_NODE_PATTERN, containerIdStr, nodeId);
       out.println(containerString);
       out.println(StringUtils.repeat("=", containerString.length()));
       boolean foundAnyLogs = false;
@@ -418,9 +473,14 @@ public class LogsCLI extends Configured implements Tool {
                 .queryParam("size", Long.toString(request.getBytes()))
                 .accept(MediaType.TEXT_PLAIN).get(ClientResponse.class);
           out.println(response.getEntity(String.class));
-          out.println("End of LogType:" + logFile + ". This log file belongs"
-              + " to a running container (" + containerIdStr + ") and so may"
-              + " not be complete.");
+          StringBuilder sb = new StringBuilder();
+          sb.append("End of LogType:" + logFile + ".");
+          if (request.getContainerState() == ContainerState.RUNNING) {
+            sb.append(" This log file belongs"
+                + " to a running container (" + containerIdStr + ") and so may"
+                + " not be complete.");
+          }
+          out.println(sb.toString());
           out.flush();
           foundAnyLogs = true;
         } catch (ClientHandlerException | UniformInterfaceException ex) {
@@ -477,13 +537,8 @@ public class LogsCLI extends Configured implements Tool {
   @VisibleForTesting
   public ContainerReport getContainerReport(String containerIdStr)
       throws YarnException, IOException {
-    YarnClient yarnClient = createYarnClient();
-    try {
-      return yarnClient.getContainerReport(
-          ContainerId.fromString(containerIdStr));
-    } finally {
-      yarnClient.close();
-    }
+    return yarnClient.getContainerReport(
+        ContainerId.fromString(containerIdStr));
   }
 
   private boolean isApplicationFinished(YarnApplicationState appState) {
@@ -508,8 +563,10 @@ public class LogsCLI extends Configured implements Tool {
         for (JSONObject amContainer : amContainersList) {
           ContainerLogsRequest amRequest = new ContainerLogsRequest(request);
           amRequest.setContainerId(amContainer.getString("containerId"));
-          amRequest.setNodeHttpAddress(
-              amContainer.getString("nodeHttpAddress"));
+          String httpAddress = amContainer.getString("nodeHttpAddress");
+          if (httpAddress != null && !httpAddress.isEmpty()) {
+            amRequest.setNodeHttpAddress(httpAddress);
+          }
           amRequest.setNodeId(amContainer.getString("nodeId"));
           requests.add(amRequest);
         }
@@ -545,8 +602,8 @@ public class LogsCLI extends Configured implements Tool {
       for (ContainerLogsRequest amRequest : requests) {
         outputAMContainerLogs(amRequest, conf, logCliHelper);
       }
-      System.out.println();      
-      System.out.println("Specified ALL for -am option. "
+      outStream.println();
+      outStream.println("Specified ALL for -am option. "
           + "Printed logs for all am containers.");
     } else {
       for (String amContainer : amContainers) {
@@ -596,21 +653,22 @@ public class LogsCLI extends Configured implements Tool {
     } else {
       if (nodeHttpAddress != null && containerId != null
           && !nodeHttpAddress.isEmpty() && !containerId.isEmpty()) {
+        ContainerState containerState = getContainerReport(containerId)
+            .getContainerState();
+        request.setContainerState(containerState);
         printContainerLogsFromRunningApplication(conf,
             request, logCliHelper);
       }
     }
   }
 
-  private int showMetaInfo(ContainerLogsRequest request,
-      LogCLIHelpers logCliHelper) throws IOException {
+  private int showContainerLogInfo(ContainerLogsRequest request,
+      LogCLIHelpers logCliHelper) throws IOException, YarnException {
     if (!request.isAppFinished()) {
-      System.err.println("The -show_meta_info command can be only used "
-          + "with finished applications");
-      return -1;
+      return printContainerInfoFromRunningApplication(request);
     } else {
-      logCliHelper.printLogMetadata(request, System.out, System.err);
-      return 0;
+      return logCliHelper.printAContainerLogMetadata(
+          request, System.out, System.err);
     }
   }
 
@@ -626,6 +684,33 @@ public class LogsCLI extends Configured implements Tool {
     }
   }
 
+  private int showApplicationLogInfo(ContainerLogsRequest request,
+      LogCLIHelpers logCliHelper) throws IOException, YarnException {
+    String appState = "Application State: "
+        + (request.isAppFinished() ? "Completed." : "Running.");
+    if (!request.isAppFinished()) {
+      List<ContainerReport> reports =
+          getContainerReportsFromRunningApplication(request);
+      List<ContainerReport> filterReports = filterContainersInfo(
+          request, reports);
+      if (filterReports.isEmpty()) {
+        System.err.println("Can not find any containers for the application:"
+            + request.getAppId() + ".");
+        return -1;
+      }
+      outStream.println(appState);
+      for (ContainerReport report : filterReports) {
+        outStream.println(String.format(LogCLIHelpers.CONTAINER_ON_NODE_PATTERN,
+            report.getContainerId(), report.getAssignedNode()));
+      }
+      return 0;
+    } else {
+      outStream.println(appState);
+      logCliHelper.printContainersList(request, System.out, System.err);
+      return 0;
+    }
+  }
+
   private Options createCommandOpts() {
     Options opts = new Options();
     opts.addOption(HELP_CMD, false, "Displays help for all commands.");
@@ -633,8 +718,8 @@ public class LogsCLI extends Configured implements Tool {
         new Option(APPLICATION_ID_OPTION, true, "ApplicationId (required)");
     opts.addOption(appIdOpt);
     opts.addOption(CONTAINER_ID_OPTION, true, "ContainerId. "
-        + "By default, it will only print syslog if the application is running."
-        + " Work with -logFiles to get other logs. If specified, the"
+        + "By default, it will print all available logs."
+        + " Work with -log_files to get only specific logs. If specified, the"
         + " applicationId can be omitted");
     opts.addOption(NODE_ADDRESS_OPTION, true, "NodeAddress in the format "
         + "nodename:port");
@@ -647,13 +732,13 @@ public class LogsCLI extends Configured implements Tool {
         + "the logs for the first AM Container as well as the second "
         + "AM Container. To get logs for all AM Containers, use -am ALL. "
         + "To get logs for the latest AM Container, use -am -1. "
-        + "By default, it will only print out syslog. Work with -logFiles "
-        + "to get other logs");
+        + "By default, it will print all available logs. Work with -log_files "
+        + "to get only specific logs.");
     amOption.setValueSeparator(',');
     amOption.setArgs(Option.UNLIMITED_VALUES);
     amOption.setArgName("AM Containers");
     opts.addOption(amOption);
-    Option logFileOpt = new Option(CONTAINER_LOG_FILES, true,
+    Option logFileOpt = new Option(PER_CONTAINER_LOG_FILES_OPTION, true,
         "Specify comma-separated value "
         + "to get specified container log files. Use \"ALL\" to fetch all the "
         + "log files for the container. It also supports Java Regex.");
@@ -661,13 +746,16 @@ public class LogsCLI extends Configured implements Tool {
     logFileOpt.setArgs(Option.UNLIMITED_VALUES);
     logFileOpt.setArgName("Log File Name");
     opts.addOption(logFileOpt);
-    opts.addOption(SHOW_META_INFO, false, "Show the log metadata, "
+    opts.addOption(SHOW_CONTAINER_LOG_INFO, false,
+        "Show the container log metadata, "
         + "including log-file names, the size of the log files. "
         + "You can combine this with --containerId to get log metadata for "
         + "the specific container, or with --nodeAddress to get log metadata "
-        + "for all the containers on the specific NodeManager. "
-        + "Currently, this option can only be used for finished "
-        + "applications.");
+        + "for all the containers on the specific NodeManager.");
+    opts.addOption(SHOW_APPLICATION_LOG_INFO, false, "Show the "
+        + "containerIds which belong to the specific Application. "
+        + "You can combine this with --nodeAddress to get containerIds "
+        + "for all the containers on the specific NodeManager.");
     opts.addOption(LIST_NODES_OPTION, false,
         "Show the list of nodes that successfully aggregated logs. "
         + "This option can only be used with finished applications.");
@@ -694,9 +782,10 @@ public class LogsCLI extends Configured implements Tool {
     printOpts.addOption(commandOpts.getOption(NODE_ADDRESS_OPTION));
     printOpts.addOption(commandOpts.getOption(APP_OWNER_OPTION));
     printOpts.addOption(commandOpts.getOption(AM_CONTAINER_OPTION));
-    printOpts.addOption(commandOpts.getOption(CONTAINER_LOG_FILES));
-    printOpts.addOption(commandOpts.getOption(SHOW_META_INFO));
+    printOpts.addOption(commandOpts.getOption(PER_CONTAINER_LOG_FILES_OPTION));
     printOpts.addOption(commandOpts.getOption(LIST_NODES_OPTION));
+    printOpts.addOption(commandOpts.getOption(SHOW_APPLICATION_LOG_INFO));
+    printOpts.addOption(commandOpts.getOption(SHOW_CONTAINER_LOG_INFO));
     printOpts.addOption(commandOpts.getOption(OUT_OPTION));
     printOpts.addOption(commandOpts.getOption(SIZE_OPTION));
     return printOpts;
@@ -736,13 +825,7 @@ public class LogsCLI extends Configured implements Tool {
   private int fetchAMContainerLogs(ContainerLogsRequest request,
       List<String> amContainersList, LogCLIHelpers logCliHelper)
       throws Exception {
-    List<String> logFiles = request.getLogTypes();
-    // if we do not specify the value for CONTAINER_LOG_FILES option,
-    // we will only output syslog
-    if (logFiles == null || logFiles.isEmpty()) {
-      logFiles = Arrays.asList("syslog");
-    }
-    request.setLogTypes(logFiles);
+
     // If the application is running, we will call the RM WebService
     // to get the AppAttempts which includes the nodeHttpAddress
     // and containerId for all the AM Containers.
@@ -785,7 +868,6 @@ public class LogsCLI extends Configured implements Tool {
     String nodeAddress = request.getNodeId();
     String appOwner = request.getAppOwner();
     boolean isAppFinished = request.isAppFinished();
-    List<String> logFiles = request.getLogTypes();
     // if we provide the node address and the application is in the final
     // state, we could directly get logs from HDFS.
     if (nodeAddress != null && isAppFinished) {
@@ -801,12 +883,15 @@ public class LogsCLI extends Configured implements Tool {
       // the ContainerReport. In the containerReport, we could get
       // nodeAddress and nodeHttpAddress
       ContainerReport report = getContainerReport(containerIdStr);
-      nodeHttpAddress =
-          report.getNodeHttpAddress().replaceFirst(
-            WebAppUtils.getHttpSchemePrefix(getConf()), "");
+      nodeHttpAddress = report.getNodeHttpAddress();
+      if (nodeHttpAddress != null && !nodeHttpAddress.isEmpty()) {
+        nodeHttpAddress = nodeHttpAddress.replaceFirst(
+                WebAppUtils.getHttpSchemePrefix(getConf()), "");
+        request.setNodeHttpAddress(nodeHttpAddress);
+      }
       nodeId = report.getAssignedNode().toString();
       request.setNodeId(nodeId);
-      request.setNodeHttpAddress(nodeHttpAddress);
+      request.setContainerState(report.getContainerState());
     } catch (IOException | YarnException ex) {
       if (isAppFinished) {
         return printContainerLogsForFinishedApplicationWithoutNodeId(
@@ -826,12 +911,6 @@ public class LogsCLI extends Configured implements Tool {
     // we will provide the NodeHttpAddress and get the container logs
     // by calling NodeManager webservice.
     if (!isAppFinished) {
-      // if we do not specify the value for CONTAINER_LOG_FILES option,
-      // we will only output syslog
-      if (logFiles == null || logFiles.isEmpty()) {
-        logFiles = Arrays.asList("syslog");
-      }
-      request.setLogTypes(logFiles);
       resultCode = printContainerLogsFromRunningApplication(getConf(), request,
           logCliHelper);
     } else {
@@ -942,32 +1021,141 @@ public class LogsCLI extends Configured implements Tool {
           ContainerLogsRequest options) throws YarnException, IOException {
     List<ContainerLogsRequest> newOptionsList =
         new ArrayList<ContainerLogsRequest>();
-    YarnClient yarnClient = createYarnClient();
-    try {
-      List<ApplicationAttemptReport> attempts =
-          yarnClient.getApplicationAttempts(options.getAppId());
-      for (ApplicationAttemptReport attempt : attempts) {
-        List<ContainerReport> containers = yarnClient.getContainers(
-            attempt.getApplicationAttemptId());
-        for (ContainerReport container : containers) {
-          ContainerLogsRequest newOptions = new ContainerLogsRequest(options);
-          newOptions.setContainerId(container.getContainerId().toString());
-          newOptions.setNodeId(container.getAssignedNode().toString());
-          newOptions.setNodeHttpAddress(container.getNodeHttpAddress()
-              .replaceFirst(WebAppUtils.getHttpSchemePrefix(getConf()), ""));
-          // if we do not specify the value for CONTAINER_LOG_FILES option,
-          // we will only output syslog
-          List<String> logFiles = newOptions.getLogTypes();
-          if (logFiles == null || logFiles.isEmpty()) {
-            logFiles = Arrays.asList("syslog");
-            newOptions.setLogTypes(logFiles);
-          }
-          newOptionsList.add(newOptions);
+    List<ContainerReport> reports =
+        getContainerReportsFromRunningApplication(options);
+    for (ContainerReport container : reports) {
+      ContainerLogsRequest newOptions = new ContainerLogsRequest(options);
+      newOptions.setContainerId(container.getContainerId().toString());
+      newOptions.setNodeId(container.getAssignedNode().toString());
+      String httpAddress = container.getNodeHttpAddress();
+      if (httpAddress != null && !httpAddress.isEmpty()) {
+        newOptions.setNodeHttpAddress(httpAddress
+            .replaceFirst(WebAppUtils.getHttpSchemePrefix(getConf()), ""));
+      }
+      newOptions.setContainerState(container.getContainerState());
+      newOptionsList.add(newOptions);
+    }
+    return newOptionsList;
+  }
+
+  private List<ContainerReport> getContainerReportsFromRunningApplication(
+      ContainerLogsRequest options) throws YarnException, IOException {
+    List<ContainerReport> reports = new ArrayList<ContainerReport>();
+    List<ApplicationAttemptReport> attempts =
+        yarnClient.getApplicationAttempts(options.getAppId());
+    Map<ContainerId, ContainerReport> containerMap = new TreeMap<
+        ContainerId, ContainerReport>();
+    for (ApplicationAttemptReport attempt : attempts) {
+      List<ContainerReport> containers = yarnClient.getContainers(
+          attempt.getApplicationAttemptId());
+      for (ContainerReport container : containers) {
+        if (!containerMap.containsKey(container.getContainerId())) {
+          containerMap.put(container.getContainerId(), container);
         }
       }
-      return newOptionsList;
-    } finally {
-      yarnClient.close();
+    }
+    reports.addAll(containerMap.values());
+    return reports;
+  }
+
+  // filter the containerReports based on the nodeId and ContainerId
+  private List<ContainerReport> filterContainersInfo(
+      ContainerLogsRequest options, List<ContainerReport> containers) {
+    List<ContainerReport> filterReports = new ArrayList<ContainerReport>(
+        containers);
+    String nodeId = options.getNodeId();
+    boolean filterBasedOnNodeId = (nodeId != null && !nodeId.isEmpty());
+    String containerId = options.getContainerId();
+    boolean filterBasedOnContainerId = (containerId != null
+        && !containerId.isEmpty());
+
+    if (filterBasedOnNodeId || filterBasedOnContainerId) {
+    // filter the reports based on the containerId and.or nodeId
+      for(ContainerReport report : containers) {
+        if (filterBasedOnContainerId) {
+          if (!report.getContainerId().toString()
+              .equalsIgnoreCase(containerId)) {
+            filterReports.remove(report);
+          }
+        }
+
+        if (filterBasedOnNodeId) {
+          if (!report.getAssignedNode().toString().equalsIgnoreCase(nodeId)) {
+            filterReports.remove(report);
+          }
+        }
+      }
+    }
+    return filterReports;
+  }
+
+  private int printContainerInfoFromRunningApplication(
+      ContainerLogsRequest options) throws YarnException, IOException {
+    String containerIdStr = options.getContainerId();
+    String nodeIdStr = options.getNodeId();
+    List<ContainerReport> reports =
+        getContainerReportsFromRunningApplication(options);
+    List<ContainerReport> filteredReports = filterContainersInfo(
+        options, reports);
+    if (filteredReports.isEmpty()) {
+      StringBuilder sb = new StringBuilder();
+      if (containerIdStr != null && !containerIdStr.isEmpty()) {
+        sb.append("Trying to get container with ContainerId: "
+            + containerIdStr + "\n");
+      }
+      if (nodeIdStr != null && !nodeIdStr.isEmpty()) {
+        sb.append("Trying to get container from NodeManager: "
+            + nodeIdStr + "\n");
+      }
+      sb.append("Can not find any matched containers for the application: "
+          + options.getAppId());
+      System.err.println(sb.toString());
+      return -1;
+    }
+    for (ContainerReport report : filteredReports) {
+      String nodeId = report.getAssignedNode().toString();
+      String nodeHttpAddress = report.getNodeHttpAddress().replaceFirst(
+          WebAppUtils.getHttpSchemePrefix(getConf()), "");
+      String containerId = report.getContainerId().toString();
+      String containerString = String.format(
+          LogCLIHelpers.CONTAINER_ON_NODE_PATTERN, containerId, nodeId);
+      outStream.println(containerString);
+      outStream.println(StringUtils.repeat("=", containerString.length()));
+      outStream.printf(LogCLIHelpers.PER_LOG_FILE_INFO_PATTERN,
+          "LogType", "LogLength");
+      outStream.println(StringUtils.repeat("=", containerString.length()));
+      List<PerLogFileInfo> infos = getContainerLogFiles(
+          getConf(), containerId, nodeHttpAddress);
+      for (PerLogFileInfo info : infos) {
+        outStream.printf(LogCLIHelpers.PER_LOG_FILE_INFO_PATTERN,
+            info.getFileName(), info.getFileLength());
+      }
+    }
+    return 0;
+  }
+
+  private static class PerLogFileInfo {
+    private String fileName;
+    private String fileLength;
+    public PerLogFileInfo(String fileName, String fileLength) {
+      setFileName(fileName);
+      setFileLength(fileLength);
+    }
+
+    public String getFileName() {
+      return fileName;
+    }
+
+    public void setFileName(String fileName) {
+      this.fileName = fileName;
+    }
+
+    public String getFileLength() {
+      return fileLength;
+    }
+
+    public void setFileLength(String fileLength) {
+      this.fileLength = fileLength;
     }
   }
 }
